@@ -1,21 +1,8 @@
 use egui::Ui;
-use crate::config::BlockingMethod;
+use crate::config::{BlockingMethod, Rule};
 use crate::daemon::SharedState;
 use crate::startup;
 use super::rule_editor::RuleEditor;
-
-/// Simple name match shared between "Block Now" and the daemon.
-fn exe_matches(proc_name: &str, rule_exe: &str) -> bool {
-    let base = std::path::Path::new(rule_exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(rule_exe);
-    if rule_exe.contains('/') {
-        proc_name == base
-    } else {
-        proc_name.to_lowercase() == base.to_lowercase()
-    }
-}
 
 pub struct RulesTab {
     pub editor:      Option<RuleEditor>,
@@ -161,21 +148,21 @@ impl RulesTab {
                 s.grace_timers.remove(&id);
                 s.grace_warned.remove(&id);
 
-                // Collect matching PIDs and method from current snapshot.
-                let snap = s.config.rules.iter().find(|r| r.id == id)
-                    .map(|r| (r.executable.clone(), r.blocking_method.clone()));
-                let pids: Vec<i32> = snap.as_ref().map(|(exe, _)| {
+                // Clone the full rule so we can use matches_process.
+                let rule_snap: Option<Rule> = s.config.rules.iter()
+                    .find(|r| r.id == id).cloned();
+                let pids: Vec<i32> = rule_snap.as_ref().map(|rule| {
                     s.processes.iter()
-                        .filter(|p| exe_matches(&p.name, exe))
+                        .filter(|p| rule.matches_process(&p.name, p.exe_path.as_deref()))
                         .map(|p| p.pid)
                         .collect()
                 }).unwrap_or_default();
 
-                drop(s); // release lock before syscalls
+                drop(s);
 
-                if let Some((exe, method)) = snap {
+                if let Some(rule) = rule_snap {
                     for pid in &pids {
-                        let result = match &method {
+                        let result = match &rule.blocking_method {
                             BlockingMethod::ForceKill => crate::blocker::force_kill_process(*pid),
                             _                        => crate::blocker::kill_process(*pid),
                         };
@@ -184,8 +171,8 @@ impl RulesTab {
                             Err(e) => log::warn!("Block Now: kill PID {pid} failed: {e}"),
                         }
                     }
-                    if matches!(method, BlockingMethod::Network) {
-                        let _ = crate::blocker::install_network_block(&exe);
+                    if matches!(rule.blocking_method, BlockingMethod::Network) {
+                        let _ = crate::blocker::install_network_block(&rule.executable);
                     }
                     if pids.is_empty() {
                         log::info!("Block Now: no matching processes found yet — daemon will block on next scan");

@@ -40,6 +40,8 @@ pub struct RuleEditor {
     res_ram_mb:   u64,
     res_ram_on:   bool,
     res_dur_secs: u64,
+
+    fuzzy_match: bool,
 }
 
 impl RuleEditor {
@@ -69,6 +71,8 @@ impl RuleEditor {
             res_ram_mb:   512,
             res_ram_on:   false,
             res_dur_secs: 300,
+
+            fuzzy_match: false,
         }
     }
 
@@ -112,6 +116,8 @@ impl RuleEditor {
             startup: rule.startup_action.clone(),
 
             res_enabled, res_cpu, res_cpu_on, res_ram_mb, res_ram_on, res_dur_secs,
+
+            fuzzy_match: rule.fuzzy_match,
         }
     }
 
@@ -147,6 +153,7 @@ impl RuleEditor {
             resource_trigger,
             persist_across_reboots: self.persist,
             blocked_until: None,
+            fuzzy_match:   self.fuzzy_match,
         }
     }
 
@@ -221,6 +228,15 @@ impl RuleEditor {
                 "Full path (e.g. /usr/bin/firefox) or just the process name \
                  (e.g. steam). Name matching is case-insensitive."
             ).small().weak());
+            ui.end_row();
+
+            ui.label("");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.fuzzy_match, "Lazy match");
+                ui.label(egui::RichText::new(
+                    "— block any process whose name contains the above (e.g. \"steam\" also catches \"steamwebhelper\")"
+                ).small().weak());
+            });
             ui.end_row();
         });
     }

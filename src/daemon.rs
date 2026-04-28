@@ -94,7 +94,7 @@ fn enforce(state: &SharedState, procs: &[ProcessInfo]) {
         }
 
         let matching: Vec<&ProcessInfo> = procs.iter()
-            .filter(|p| process_matches(p, rule))
+            .filter(|p| rule.matches_process(&p.name, p.exe_path.as_deref()))
             .collect();
 
         if matching.is_empty() {
@@ -231,24 +231,3 @@ fn expire_rest_of_day(state: &SharedState) {
     }
 }
 
-fn process_matches(proc: &ProcessInfo, rule: &Rule) -> bool {
-    let exe = &rule.executable;
-
-    // Exact exe-path match.
-    if let Some(proc_exe) = &proc.exe_path {
-        if proc_exe == exe { return true; }
-    }
-
-    let rule_name = std::path::Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(exe.as_str());
-
-    if exe.contains('/') {
-        // Full path given → exact basename comparison.
-        proc.name == rule_name
-    } else {
-        // Name-only (e.g. "steam") → case-insensitive match.
-        proc.name.to_lowercase() == rule_name.to_lowercase()
-    }
-}

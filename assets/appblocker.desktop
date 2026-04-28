@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=AppBlocker
+GenericName=Application Blocker
+Comment=Block and schedule applications based on rules, time, and resource usage
+Exec=appblocker
+Icon=security-high
+Terminal=false
+Type=Application
+Categories=Utility;System;
+Keywords=block;focus;productivity;scheduler;apps;kill;
+StartupNotify=true

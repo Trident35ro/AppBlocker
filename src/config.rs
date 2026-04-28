@@ -147,6 +147,10 @@ pub struct Rule {
     /// Populated when schedule == RestOfDay; midnight of today.
     #[serde(default)]
     pub blocked_until: Option<DateTime<Local>>,
+    /// If true, match any process whose name *contains* the rule name (case-insensitive).
+    /// If false (default), require a case-insensitive exact name match.
+    #[serde(default)]
+    pub fuzzy_match: bool,
 }
 
 impl Rule {
@@ -163,6 +167,7 @@ impl Rule {
             resource_trigger:      None,
             persist_across_reboots: true,
             blocked_until:         None,
+            fuzzy_match:           false,
         }
     }
 
@@ -198,6 +203,25 @@ impl Rule {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&self.executable)
+    }
+
+    /// Returns true if this rule should target the given process.
+    /// Exact exe-path always wins; then name matching respects `fuzzy_match`.
+    pub fn matches_process(&self, proc_name: &str, proc_exe: Option<&str>) -> bool {
+        if let Some(exe) = proc_exe {
+            if exe == self.executable { return true; }
+        }
+
+        let base = self.exe_name().to_lowercase();
+        let name = proc_name.to_lowercase();
+
+        if self.fuzzy_match {
+            name.contains(&base)
+        } else if self.executable.contains('/') {
+            proc_name == self.exe_name()        // exact basename (full path given)
+        } else {
+            name == base                        // case-insensitive exact
+        }
     }
 }
 
