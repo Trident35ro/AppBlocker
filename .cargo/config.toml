@@ -1,0 +1,11 @@
+[build]
+rustflags = [
+    # Scrub your project code
+    "--remap-path-prefix", "/home/segual/Documents/projects/AppBlocker=src",
+    
+    # Scrub the downloaded dependencies
+    "--remap-path-prefix", "/home/segual/.cargo/registry=cargo",
+    
+    # Scrub the standard library
+    "--remap-path-prefix", "/home/segual/.rustup/toolchains=rustup"
+]
