@@ -5,6 +5,8 @@ mod daemon;
 mod startup;
 mod notification;
 mod tray;
+mod usage_tracker;
+mod network;
 mod ui;
 
 use std::sync::{Arc, RwLock};
@@ -19,10 +21,8 @@ fn main() {
 
     let state = Arc::new(RwLock::new(AppState::new()));
 
-    // Start background enforcement thread.
     daemon::start_daemon(state.clone());
 
-    // Tray flags shared between tray thread and UI.
     let tray_flags = Arc::new(TrayFlags::new());
 
     if state.read().unwrap().config.show_tray_icon {
@@ -38,8 +38,8 @@ fn main() {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AppBlocker")
-            .with_inner_size([1080.0, 700.0])
-            .with_min_inner_size([780.0, 520.0])
+            .with_inner_size([1200.0, 740.0])
+            .with_min_inner_size([800.0, 540.0])
             .with_visible(!start_hidden),
         ..Default::default()
     };

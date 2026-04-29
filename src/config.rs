@@ -1,19 +1,15 @@
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-// ── Blocking method ──────────────────────────────────────────────────────────
+// ── Blocking method ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BlockingMethod {
-    /// Send SIGTERM — lets the app clean up before exiting (recommended).
     Kill,
-    /// Send SIGKILL — immediate termination, no cleanup (pkill -9 equivalent).
     ForceKill,
-    /// Install a ~/.local/bin wrapper that checks a state file before exec.
     Wrapper,
-    /// Add an nftables output rule for the current UID (requires pkexec/root).
     Network,
 }
 
@@ -32,7 +28,7 @@ impl std::fmt::Display for BlockingMethod {
     }
 }
 
-// ── Schedule ─────────────────────────────────────────────────────────────────
+// ── Schedule ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimeRangeConfig {
@@ -44,13 +40,13 @@ pub struct TimeRangeConfig {
 
 impl TimeRangeConfig {
     pub fn is_active_now(&self) -> bool {
-        let now  = Local::now().time();
-        let h_s  = self.start_hour as u32;
-        let m_s  = self.start_min  as u32;
-        let h_e  = self.end_hour   as u32;
-        let m_e  = self.end_min    as u32;
-        let start = chrono::NaiveTime::from_hms_opt(h_s, m_s, 0).unwrap_or_default();
-        let end   = chrono::NaiveTime::from_hms_opt(h_e, m_e, 0).unwrap_or_default();
+        let now   = Local::now().time();
+        let start = chrono::NaiveTime::from_hms_opt(
+            self.start_hour as u32, self.start_min as u32, 0,
+        ).unwrap_or_default();
+        let end = chrono::NaiveTime::from_hms_opt(
+            self.end_hour as u32, self.end_min as u32, 0,
+        ).unwrap_or_default();
         if start <= end { now >= start && now < end } else { now >= start || now < end }
     }
 }
@@ -59,19 +55,106 @@ impl TimeRangeConfig {
 pub enum ScheduleType {
     Always,
     TimeRange(TimeRangeConfig),
-    /// Active until midnight; `blocked_until` stores the exact timestamp.
     RestOfDay,
 }
 
 impl std::fmt::Display for ScheduleType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Always => write!(f, "Always"),
-            Self::TimeRange(r) => write!(
-                f, "{:02}:{:02} – {:02}:{:02}",
-                r.start_hour, r.start_min, r.end_hour, r.end_min,
-            ),
-            Self::RestOfDay => write!(f, "Rest of Day"),
+            Self::Always       => write!(f, "Always"),
+            Self::TimeRange(r) => write!(f, "{:02}:{:02} – {:02}:{:02}",
+                r.start_hour, r.start_min, r.end_hour, r.end_min),
+            Self::RestOfDay    => write!(f, "Rest of Day"),
+        }
+    }
+}
+
+// ── Unavailability periods ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnavailPeriod {
+    pub id:         String,
+    pub label:      String,
+    /// Days of the week: 0=Mon … 6=Sun
+    pub days:       Vec<u8>,
+    pub start_hour: u8,
+    pub start_min:  u8,
+    pub end_hour:   u8,
+    pub end_min:    u8,
+}
+
+impl UnavailPeriod {
+    pub fn new() -> Self {
+        Self {
+            id:         Uuid::new_v4().to_string(),
+            label:      String::new(),
+            days:       (0u8..5).collect(),
+            start_hour: 22, start_min: 0,
+            end_hour:   8,  end_min:   0,
+        }
+    }
+
+    pub fn is_active_now(&self) -> bool {
+        let now = Local::now();
+        let wd  = now.weekday().num_days_from_monday() as u8;
+        if !self.days.contains(&wd) { return false; }
+
+        let time  = now.time();
+        let start = chrono::NaiveTime::from_hms_opt(
+            self.start_hour as u32, self.start_min as u32, 0,
+        ).unwrap_or_default();
+        let end = chrono::NaiveTime::from_hms_opt(
+            self.end_hour as u32, self.end_min as u32, 0,
+        ).unwrap_or_default();
+        if start <= end { time >= start && time < end } else { time >= start || time < end }
+    }
+
+    pub fn day_name(d: u8) -> &'static str {
+        match d { 0=>"Mon", 1=>"Tue", 2=>"Wed", 3=>"Thu", 4=>"Fri", 5=>"Sat", 6=>"Sun", _=>"?" }
+    }
+}
+
+// ── Time limit ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimeLimit {
+    /// Total seconds of use allowed per day.
+    pub daily_limit_secs:  u64,
+    pub reset_hour:        u8,
+    pub reset_min:         u8,
+    /// Kill the process when the limit hits (false = notify only).
+    pub hard_block:        bool,
+    /// Seconds-remaining thresholds at which to send a reminder (e.g. [600,300,60]).
+    pub remind_thresholds: Vec<u64>,
+}
+
+impl Default for TimeLimit {
+    fn default() -> Self {
+        Self {
+            daily_limit_secs:  7200,
+            reset_hour:        0,
+            reset_min:         0,
+            hard_block:        false,
+            remind_thresholds: vec![600, 300, 60],
+        }
+    }
+}
+
+// ── Rule action ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum RuleAction {
+    #[default]
+    Block,
+    /// Show a "why are you opening this?" prompt instead of blocking.
+    Mindful,
+}
+
+impl std::fmt::Display for RuleAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block   => write!(f, "Block"),
+            Self::Mindful => write!(f, "Mindful"),
         }
     }
 }
@@ -82,7 +165,6 @@ impl std::fmt::Display for ScheduleType {
 pub struct ResourceTrigger {
     pub cpu_percent:   Option<f32>,
     pub ram_mb:        Option<u64>,
-    /// How long the threshold must be exceeded before blocking.
     pub duration_secs: u64,
 }
 
@@ -129,45 +211,140 @@ impl std::fmt::Display for StartupAction {
     }
 }
 
-// ── Rule ─────────────────────────────────────────────────────────────────────
+// ── Network rules ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NetworkBlockMethod {
+    Nftables,
+    Dns,
+}
+
+impl Default for NetworkBlockMethod {
+    fn default() -> Self { Self::Nftables }
+}
+
+impl std::fmt::Display for NetworkBlockMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nftables => write!(f, "nftables (IP/domain block, requires root)"),
+            Self::Dns      => write!(f, "DNS via /etc/hosts (domain block, requires root)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NetworkPreset {
+    BlockNsfw,
+    BlockDistracting,
+    BlockBoth,
+}
+
+impl std::fmt::Display for NetworkPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BlockNsfw        => write!(f, "Block NSFW Media"),
+            Self::BlockDistracting => write!(f, "Block Low-Quality / Distracting Sites"),
+            Self::BlockBoth        => write!(f, "Block NSFW + Distracting"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkEntry {
+    pub value:   String,
+    pub comment: String,
+    pub enabled: bool,
+}
+
+impl NetworkEntry {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self { value: value.into(), comment: String::new(), enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkRule {
+    pub id:      String,
+    pub name:    String,
+    pub enabled: bool,
+    pub method:  NetworkBlockMethod,
+    pub entries: Vec<NetworkEntry>,
+    /// Empty = system-wide; otherwise rule is only active when one of these apps is running.
+    #[serde(default)]
+    pub apply_to_apps: Vec<String>,
+    #[serde(default)]
+    pub shutdown_on_connect: bool,
+    /// Whether the rule has been pushed to the system (DNS/nftables).
+    #[serde(default)]
+    pub applied: bool,
+}
+
+impl NetworkRule {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id:                  Uuid::new_v4().to_string(),
+            name:                name.into(),
+            enabled:             true,
+            method:              NetworkBlockMethod::default(),
+            entries:             Vec::new(),
+            apply_to_apps:       Vec::new(),
+            shutdown_on_connect: false,
+            applied:             false,
+        }
+    }
+}
+
+// ── Rule ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
-    pub id:                    String,
-    pub name:                  String,
-    pub executable:            String,
-    pub blocking_method:       BlockingMethod,
-    pub enabled:               bool,
-    pub schedule:              ScheduleType,
-    pub grace_period:          GracePeriod,
-    pub startup_action:        StartupAction,
-    pub resource_trigger:      Option<ResourceTrigger>,
-    /// false = rule is discarded on next launch (session-only).
+    pub id:                     String,
+    pub name:                   String,
+    pub executable:             String,
+    pub blocking_method:        BlockingMethod,
+    pub enabled:                bool,
+    pub schedule:               ScheduleType,
+    pub grace_period:           GracePeriod,
+    pub startup_action:         StartupAction,
+    pub resource_trigger:       Option<ResourceTrigger>,
     pub persist_across_reboots: bool,
-    /// Populated when schedule == RestOfDay; midnight of today.
     #[serde(default)]
     pub blocked_until: Option<DateTime<Local>>,
-    /// If true, match any process whose name *contains* the rule name (case-insensitive).
-    /// If false (default), require a case-insensitive exact name match.
     #[serde(default)]
     pub fuzzy_match: bool,
+    #[serde(default)]
+    pub time_limit: Option<TimeLimit>,
+    #[serde(default)]
+    pub unavail_periods: Vec<UnavailPeriod>,
+    #[serde(default)]
+    pub rule_action: RuleAction,
+    /// In Mindful mode: also prompt when the app is detected already running.
+    #[serde(default)]
+    pub mindful_intercept_running: bool,
+    #[serde(default)]
+    pub track_usage: bool,
 }
 
 impl Rule {
     pub fn new(name: impl Into<String>, executable: impl Into<String>) -> Self {
         Self {
-            id:                    Uuid::new_v4().to_string(),
-            name:                  name.into(),
-            executable:            executable.into(),
-            blocking_method:       BlockingMethod::default(),
-            enabled:               true,
-            schedule:              ScheduleType::Always,
-            grace_period:          GracePeriod::default(),
-            startup_action:        StartupAction::default(),
-            resource_trigger:      None,
+            id:                     Uuid::new_v4().to_string(),
+            name:                   name.into(),
+            executable:             executable.into(),
+            blocking_method:        BlockingMethod::default(),
+            enabled:                true,
+            schedule:               ScheduleType::Always,
+            grace_period:           GracePeriod::default(),
+            startup_action:         StartupAction::default(),
+            resource_trigger:       None,
             persist_across_reboots: true,
-            blocked_until:         None,
-            fuzzy_match:           false,
+            blocked_until:          None,
+            fuzzy_match:            false,
+            time_limit:             None,
+            unavail_periods:        Vec::new(),
+            rule_action:            RuleAction::Block,
+            mindful_intercept_running: false,
+            track_usage:            false,
         }
     }
 
@@ -182,22 +359,25 @@ impl Rule {
         }
     }
 
+    pub fn is_unavail_active(&self) -> bool {
+        self.unavail_periods.iter().any(|p| p.is_active_now())
+    }
+
     pub fn block_rest_of_day(&mut self) {
         let now      = Local::now();
         let tomorrow = now.date_naive().succ_opt().unwrap_or(now.date_naive());
         let midnight = match Local.from_local_datetime(
             &tomorrow.and_hms_opt(0, 0, 0).unwrap()
         ) {
-            chrono::LocalResult::Single(dt)      => dt,
+            chrono::LocalResult::Single(dt)       => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
             chrono::LocalResult::None             => now + chrono::Duration::hours(24),
         };
-        self.schedule     = ScheduleType::RestOfDay;
+        self.schedule      = ScheduleType::RestOfDay;
         self.blocked_until = Some(midnight);
-        self.enabled      = true;
+        self.enabled       = true;
     }
 
-    /// Basename of the executable path.
     pub fn exe_name(&self) -> &str {
         std::path::Path::new(&self.executable)
             .file_name()
@@ -205,22 +385,18 @@ impl Rule {
             .unwrap_or(&self.executable)
     }
 
-    /// Returns true if this rule should target the given process.
-    /// Exact exe-path always wins; then name matching respects `fuzzy_match`.
     pub fn matches_process(&self, proc_name: &str, proc_exe: Option<&str>) -> bool {
         if let Some(exe) = proc_exe {
             if exe == self.executable { return true; }
         }
-
         let base = self.exe_name().to_lowercase();
         let name = proc_name.to_lowercase();
-
         if self.fuzzy_match {
             name.contains(&base)
         } else if self.executable.contains('/') {
-            proc_name == self.exe_name()        // exact basename (full path given)
+            proc_name == self.exe_name()
         } else {
-            name == base                        // case-insensitive exact
+            name == base
         }
     }
 }
@@ -239,19 +415,27 @@ pub struct AppConfig {
     pub start_minimized: bool,
     #[serde(default = "default_interval")]
     pub check_interval_secs: u64,
+    #[serde(default)]
+    pub network_rules: Vec<NetworkRule>,
+    /// None = keep forever; Some(n) = discard records older than n days.
+    #[serde(default = "default_retention")]
+    pub usage_retention_days: Option<u64>,
 }
 
-fn default_true()     -> bool { true }
-fn default_interval() -> u64  { 5    }
+fn default_true()      -> bool        { true }
+fn default_interval()  -> u64         { 5    }
+fn default_retention() -> Option<u64> { Some(90) }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            rules:               Vec::new(),
-            show_tray_icon:      true,
-            daemon_enabled:      true,
-            start_minimized:     false,
-            check_interval_secs: 5,
+            rules:                Vec::new(),
+            show_tray_icon:       true,
+            daemon_enabled:       true,
+            start_minimized:      false,
+            check_interval_secs:  5,
+            network_rules:        Vec::new(),
+            usage_retention_days: Some(90),
         }
     }
 }
