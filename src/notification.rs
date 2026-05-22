@@ -67,3 +67,53 @@ pub fn send_time_limit_reached(app_name: &str, hard_block: bool) {
         .urgency(Urgency::Critical)
         .show();
 }
+
+// ── Session notifications — append to notification.rs ────────────────────────
+
+pub fn send_session_started(name: &str, duration_mins: u64) {
+    let s = if duration_mins == 1 { "" } else { "s" };
+    let _ = Notification::new()
+        .summary("AppBlocker — Focus Session Started")
+        .body(&format!("🎯 \"{name}\" session started ({duration_mins} minute{s})."))
+        .icon("appointment-new")
+        .urgency(Urgency::Normal)
+        .show();
+}
+
+pub fn send_session_ended(name: &str) {
+    let _ = Notification::new()
+        .summary("AppBlocker — Session Complete")
+        .body(&format!("✅ \"{name}\" focus session finished. Great work!"))
+        .icon("appointment-missed")
+        .urgency(Urgency::Normal)
+        .show();
+}
+
+pub fn send_session_cancelled(name: &str) {
+    let _ = Notification::new()
+        .summary("AppBlocker — Session Cancelled")
+        .body(&format!("\"{}\" session was cancelled.", name))
+        .icon("appointment-missed")
+        .urgency(Urgency::Low)
+        .show();
+}
+
+pub fn send_break_started(session_name: &str, duration_mins: u64) {
+    let s = if duration_mins == 1 { "" } else { "s" };
+    let _ = Notification::new()
+        .summary("AppBlocker — Break Time!")
+        .body(&format!("☕ Break started for \"{session_name}\" ({duration_mins} minute{s}). Blocked apps are temporarily allowed."))
+        .icon("appointment-soon")
+        .urgency(Urgency::Normal)
+        .show();
+}
+
+pub fn send_break_ended(session_name: &str) {
+    let _ = Notification::new()
+        .summary("AppBlocker — Back to Focus")
+        .body(&format!("🎯 Break over — \"{session_name}\" focus mode resumed."))
+        .icon("appointment-new")
+        .urgency(Urgency::Normal)
+        .show();
+}
+

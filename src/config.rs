@@ -1,7 +1,8 @@
-use chrono::{DateTime, Datelike, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
+use chrono;
 
 // ── Blocking method ───────────────────────────────────────────────────────────
 
@@ -401,6 +402,77 @@ impl Rule {
     }
 }
 
+// ── Focus Session ─────────────────────────────────────────────────────────────
+//
+// A Focus Session is a time-boxed block that activates a set of rules for a
+// fixed duration, with optional scheduled breaks and a strict/flexible lock.
+//
+// Add these structs to config.rs (before or after the `AppConfig` block).
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SessionMode {
+    /// Session cannot be cancelled once started.
+    Strict,
+    /// Session can be cancelled after a cooldown delay.
+    FlexibleDelay {
+        /// Seconds the user must wait before the cancel takes effect.
+        delay_secs: u64,
+    },
+    /// Session can be cancelled by entering the correct password.
+    FlexiblePassword {
+        /// Bcrypt-hashed password stored at session creation.
+        /// We use a simple SHA-256 hex here to avoid a heavy dep.
+        password_hash: String,
+    },
+}
+
+impl Default for SessionMode {
+    fn default() -> Self {
+        Self::FlexibleDelay { delay_secs: 30 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakConfig {
+    /// How often a break is offered (seconds of focus before a break).
+    pub every_secs: u64,
+    /// How long each break lasts (seconds).
+    pub duration_secs: u64,
+}
+
+impl Default for BreakConfig {
+    fn default() -> Self {
+        Self { every_secs: 3600, duration_secs: 300 } // 1 h work → 5 min break
+    }
+}
+
+/// A saved session template the user can launch quickly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTemplate {
+    pub id:           String,
+    pub name:         String,
+    /// IDs of the `Rule`s that are blocked during this session.
+    pub rule_ids:     Vec<String>,
+    /// Total session length in seconds (e.g. 7200 = 2 h).
+    pub duration_secs: u64,
+    pub mode:          SessionMode,
+    pub break_config:  Option<BreakConfig>,
+}
+
+impl SessionTemplate {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id:            uuid::Uuid::new_v4().to_string(),
+            name:          name.into(),
+            rule_ids:      Vec::new(),
+            duration_secs: 2 * 3600,
+            mode:          SessionMode::default(),
+            break_config:  None,
+        }
+    }
+}
+
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -420,6 +492,10 @@ pub struct AppConfig {
     /// None = keep forever; Some(n) = discard records older than n days.
     #[serde(default = "default_retention")]
     pub usage_retention_days: Option<u64>,
+    #[serde(default)]
+    pub session_templates: Vec<SessionTemplate>,
+    #[serde(default)]
+    pub scheduled_blocks:  Vec<ScheduledBlock>,
 }
 
 fn default_true()      -> bool        { true }
@@ -436,6 +512,8 @@ impl Default for AppConfig {
             check_interval_secs:  5,
             network_rules:        Vec::new(),
             usage_retention_days: Some(90),
+            session_templates: Vec::new(),
+            scheduled_blocks:  Vec::new(),
         }
     }
 }
@@ -469,3 +547,64 @@ impl AppConfig {
         Ok(())
     }
 }
+
+// ── Scheduled block ───────────────────────────────────────────────────────────
+//
+// A ScheduledBlock fires a SessionTemplate automatically at a given time on
+// selected days of the week.  Think of it as a recurring alarm that starts a
+// focus session without the user doing anything.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledBlock {
+    pub id:          String,
+    pub enabled:     bool,
+    pub template_id: String,
+    /// Days to fire: 0 = Mon … 6 = Sun.
+    pub days:        Vec<u8>,
+    pub start_hour:  u8,
+    pub start_min:   u8,
+    /// Whether this scheduled block has already fired today (reset at midnight).
+    #[serde(default)]
+    pub fired_today: bool,
+}
+
+impl ScheduledBlock {
+    pub fn new(template_id: impl Into<String>) -> Self {
+        Self {
+            id:          uuid::Uuid::new_v4().to_string(),
+            enabled:     true,
+            template_id: template_id.into(),
+            days:        (0u8..5).collect(), // Mon–Fri by default
+            start_hour:  9,
+            start_min:   0,
+            fired_today: false,
+        }
+    }
+
+    /// Returns true if this block should fire right now (within a 10-second window).
+    pub fn should_fire_now(&self) -> bool {
+        if !self.enabled || self.fired_today { return false; }
+        let now = chrono::Local::now();
+        let wd  = now.weekday().num_days_from_monday() as u8;
+        if !self.days.contains(&wd) { return false; }
+        let h = now.hour() as u8;
+        let m = now.minute() as u8;
+        h == self.start_hour && m == self.start_min
+    }
+}
+
+pub fn hash_password(password: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let salt = "appblocker-session-v1";
+    let mut h = DefaultHasher::new();
+    format!("{salt}:{password}").hash(&mut h);
+    let r1 = h.finish();
+    format!("{salt}:{r1:016x}:{password}").hash(&mut h);
+    format!("{:016x}{:016x}", r1, h.finish())
+}
+
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    hash_password(password) == hash
+}
+

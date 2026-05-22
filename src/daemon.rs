@@ -6,9 +6,70 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 
 use crate::config::{AppConfig, BlockingMethod, Rule, RuleAction, ScheduleType, TimeLimit};
+use crate::config::{BreakConfig, SessionMode, SessionTemplate};
 use crate::monitor::{ProcessInfo, ProcessMonitor};
 use crate::usage_tracker::UsageData;
 use crate::{blocker, notification};
+
+// ── 1. New struct — place before `AppState` ───────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ActiveSession {
+    pub template_id:   String,
+    pub template_name: String,
+    /// IDs of rules that are *additionally* force-enabled for this session.
+    pub rule_ids:      Vec<String>,
+    pub mode:          SessionMode,
+    /// Wall-clock instant the session started.
+    pub started_at:    Instant,
+    /// Total duration of the session.
+    pub duration:      Duration,
+    /// Break configuration, if any.
+    pub break_config:  Option<BreakConfig>,
+    /// When the current break ends (None = not on a break).
+    pub break_until:   Option<Instant>,
+    /// When the next break starts (None = no breaks configured).
+    pub next_break_at: Option<Instant>,
+    // ── Cancel state (Flexible modes only) ────────────────────────────────
+    /// When a cancel request was made (for FlexibleDelay).
+    pub cancel_requested_at: Option<Instant>,
+}
+
+impl ActiveSession {
+    pub fn new(tmpl: &SessionTemplate) -> Self {
+        let next_break_at = tmpl.break_config.as_ref().map(|b| {
+            Instant::now() + Duration::from_secs(b.every_secs)
+        });
+        Self {
+            template_id:        tmpl.id.clone(),
+            template_name:      tmpl.name.clone(),
+            rule_ids:           tmpl.rule_ids.clone(),
+            mode:               tmpl.mode.clone(),
+            started_at:         Instant::now(),
+            duration:           Duration::from_secs(tmpl.duration_secs),
+            break_config:       tmpl.break_config.clone(),
+            break_until:        None,
+            next_break_at,
+            cancel_requested_at: None,
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration { self.started_at.elapsed() }
+    pub fn remaining(&self) -> Duration {
+        self.duration.checked_sub(self.elapsed()).unwrap_or_default()
+    }
+    pub fn is_expired(&self) -> bool { self.elapsed() >= self.duration }
+    pub fn on_break(&self) -> bool {
+        self.break_until.map(|t| Instant::now() < t).unwrap_or(false)
+    }
+    pub fn break_remaining(&self) -> Option<Duration> {
+        self.break_until.map(|t| t.checked_duration_since(Instant::now()).unwrap_or_default())
+    }
+    pub fn next_break_in(&self) -> Option<Duration> {
+        if self.on_break() { return None; }
+        self.next_break_at.map(|t| t.checked_duration_since(Instant::now()).unwrap_or_default())
+    }
+}
 
 // ── Shared app state ──────────────────────────────────────────────────────────
 
@@ -26,6 +87,9 @@ pub struct AppState {
     pub last_usage_reset:     HashMap<String, Instant>,
     // Mindful mode throttle
     pub mindful_last_prompt:  HashMap<String, Instant>,
+    pub active_session: Option<ActiveSession>,
+    /// Pending cancel for FlexibleDelay — counts down to zero then cancels.
+    pub cancel_countdown: Option<Instant>,
 }
 
 impl AppState {
@@ -44,6 +108,8 @@ impl AppState {
             time_limit_warned:   HashMap::new(),
             last_usage_reset:    HashMap::new(),
             mindful_last_prompt: HashMap::new(),
+            active_session:      None,
+            cancel_countdown:    None,
         }
     }
 
@@ -65,11 +131,52 @@ pub fn start_daemon(state: SharedState) {
         .expect("failed to spawn daemon thread");
 }
 
+// ── 5. Scheduled block firing — add inside `run()` loop ──────────────────────
+//
+// Add this call at the bottom of the `run()` loop, before the sleep:
+
+fn fire_scheduled_blocks(state: &SharedState) {
+    if state.read().unwrap().active_session.is_some() { return; }
+
+    let now = chrono::Local::now();
+
+    // Reset fired_today flags at midnight
+    {
+        let mut s = state.write().unwrap();
+        for sb in &mut s.config.scheduled_blocks {
+            if now.hour() == 0 && now.minute() == 0 {
+                sb.fired_today = false;
+            }
+        }
+    }
+
+    let to_fire: Vec<String> = {
+        let s = state.read().unwrap();
+        s.config.scheduled_blocks.iter()
+            .filter(|sb| sb.should_fire_now())
+            .map(|sb| sb.template_id.clone())
+            .collect()
+    };
+
+    for tmpl_id in to_fire {
+        let tmpl = {
+            let s = state.read().unwrap();
+            s.config.session_templates.iter().find(|t| t.id == tmpl_id).cloned()
+        };
+        if let Some(tmpl) = tmpl {
+            start_session(state, &tmpl);
+            let mut s = state.write().unwrap();
+            for sb in &mut s.config.scheduled_blocks {
+                if sb.template_id == tmpl_id { sb.fired_today = true; }
+            }
+        }
+    }
+}
+
 fn run(state: SharedState) {
-    let mut monitor   = ProcessMonitor::new();
-    // Per-rule usage cache for disk persistence (only in daemon thread)
+    let mut monitor     = ProcessMonitor::new();
     let mut usage_cache: HashMap<String, UsageData> = HashMap::new();
-    let mut last_flush = Instant::now();
+    let mut last_flush  = Instant::now();
 
     loop {
         let (running, interval) = {
@@ -84,20 +191,163 @@ fn run(state: SharedState) {
 
         let procs = monitor.scan();
         {
-            let mut s         = state.write().unwrap();
-            s.processes          = procs.clone();
+            let mut s = state.write().unwrap();
+            s.processes           = procs.clone();
             s.last_process_update = Some(Instant::now());
         }
 
+        // Session enforcement must come AFTER procs is defined
+        enforce_session(&state, &procs);
+        fire_scheduled_blocks(&state);
+
         enforce(&state, &procs, interval, &mut usage_cache);
 
-        // Flush usage data to disk every 60 s
         if last_flush.elapsed() >= Duration::from_secs(60) {
             for data in usage_cache.values() { data.save(); }
             last_flush = Instant::now();
         }
 
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+// ── 4. Session enforcement — add inside `enforce()` ──────────────────────────
+//
+// Call this at the TOP of `enforce()`, before the existing rule loop:
+
+// Replace the entire enforce_session() function in daemon.rs with this:
+
+fn enforce_session(state: &SharedState, procs: &[crate::monitor::ProcessInfo]) {
+
+    // ── Step 1: tick the session state, decide what notification to send ──
+    // We do everything under ONE write lock, extract what we need, then drop
+    // before calling any notification (which may block).
+
+    #[derive(Debug)]
+    enum SessionTick {
+        BreakEnded(String),
+        BreakStarted(String, u64),   // (name, duration_mins)
+        Expired(String),
+        CancelDelayExpired(String),
+        Ongoing { rule_ids: Vec<String>, on_break: bool },
+        NoSession,
+    }
+
+    let tick = {
+        let mut s = state.write().unwrap();
+
+        let session = match &mut s.active_session {
+            None    => { return; }
+            Some(s) => s,
+        };
+
+        let now = Instant::now();
+
+        // Session expired?
+        if session.is_expired() {
+            let name = session.template_name.clone();
+            s.active_session = None;
+            SessionTick::Expired(name)
+
+        // Cancel delay expired?
+        } else if let SessionMode::FlexibleDelay { delay_secs } = &session.mode.clone() {
+            if let Some(req_at) = session.cancel_requested_at {
+                if req_at.elapsed() >= Duration::from_secs(*delay_secs) {
+                    let name = session.template_name.clone();
+                    s.active_session = None;
+                    SessionTick::CancelDelayExpired(name)
+                } else {
+                    // Still counting down — treat as ongoing
+                    let ids    = session.rule_ids.clone();
+                    let on_brk = session.on_break();
+                    SessionTick::Ongoing { rule_ids: ids, on_break: on_brk }
+                }
+            } else {
+                let ids    = session.rule_ids.clone();
+                let on_brk = session.on_break();
+                SessionTick::Ongoing { rule_ids: ids, on_break: on_brk }
+            }
+
+        // Break just ended?
+        } else if let Some(until) = session.break_until {
+            if now >= until {
+                session.break_until = None;
+                session.next_break_at = session.break_config.as_ref().map(|b| {
+                    now + Duration::from_secs(b.every_secs)
+                });
+                let name = session.template_name.clone();
+                SessionTick::BreakEnded(name)
+            } else {
+                // Still on break
+                let ids = session.rule_ids.clone();
+                SessionTick::Ongoing { rule_ids: ids, on_break: true }
+            }
+
+        // Time to start a break?
+        } else if let Some(next) = session.next_break_at {
+            if now >= next {
+                let dur = session.break_config.as_ref()
+                    .map(|b| b.duration_secs).unwrap_or(300);
+                session.break_until   = Some(now + Duration::from_secs(dur));
+                session.next_break_at = None;
+                let name = session.template_name.clone();
+                SessionTick::BreakStarted(name, dur / 60)
+            } else {
+                let ids    = session.rule_ids.clone();
+                let on_brk = session.on_break();
+                SessionTick::Ongoing { rule_ids: ids, on_break: on_brk }
+            }
+
+        } else {
+            let ids    = session.rule_ids.clone();
+            let on_brk = session.on_break();
+            SessionTick::Ongoing { rule_ids: ids, on_break: on_brk }
+        }
+        // write lock is dropped here
+    };
+
+    // ── Step 2: send notifications (lock is fully released) ───────────────
+    match tick {
+        SessionTick::NoSession => {}
+
+        SessionTick::Expired(name) => {
+            crate::notification::send_session_ended(&name);
+        }
+
+        SessionTick::CancelDelayExpired(name) => {
+            crate::notification::send_session_cancelled(&name);
+        }
+
+        SessionTick::BreakEnded(name) => {
+            crate::notification::send_break_ended(&name);
+            // Re-run next tick to immediately enforce focus blocking.
+        }
+
+        SessionTick::BreakStarted(name, mins) => {
+            crate::notification::send_break_started(&name, mins);
+        }
+
+        SessionTick::Ongoing { rule_ids, on_break } => {
+            if on_break { return; } // apps are free during break
+
+            // ── Step 3: enforce blocking for session rules ─────────────
+            let rules: Vec<crate::config::Rule> = {
+                let s = state.read().unwrap();
+                s.config.rules.iter()
+                    .filter(|r| rule_ids.contains(&r.id))
+                    .cloned()
+                    .collect()
+            };
+
+            for rule in &rules {
+                let matching: Vec<_> = procs.iter()
+                    .filter(|p| rule.matches_process(&p.name, p.exe_path.as_deref()))
+                    .collect();
+                for p in matching {
+                    do_block(rule, p);
+                }
+            }
+        }
     }
 }
 
@@ -435,3 +685,75 @@ fn expire_rest_of_day(state: &SharedState) {
 
 // chrono import needed for hour()
 use chrono::Timelike;
+
+// ── 3. Public session control API ─────────────────────────────────────────────
+//
+// Add these free functions (they take SharedState so they're callable from UI).
+
+/// Start a session from a saved template. Fails silently if one is already running.
+pub fn start_session(state: &SharedState, template: &SessionTemplate) {
+    let mut s = state.write().unwrap();
+    if s.active_session.is_some() { return; }
+    log::info!("starting focus session '{}'", template.name);
+    s.active_session = Some(ActiveSession::new(template));
+    // Force-enable all rules in the session.
+    for id in &template.rule_ids {
+        if let Some(r) = s.config.rules.iter_mut().find(|r| &r.id == id) {
+            r.enabled = true;
+        }
+    }
+    crate::notification::send_session_started(&template.name, template.duration_secs / 60);
+}
+
+/// Request cancellation of the running session.
+/// - Strict: always fails (returns false).
+/// - FlexibleDelay: arms a countdown; returns true once countdown expires.
+/// - FlexiblePassword: verifies password; returns true immediately if correct.
+pub fn request_cancel(state: &SharedState, password_attempt: Option<&str>) -> CancelResult {
+    let mut s = state.write().unwrap();
+    let session = match &mut s.active_session {
+        Some(s) => s,
+        None    => return CancelResult::NoSession,
+    };
+
+    match &session.mode.clone() {
+        SessionMode::Strict => CancelResult::Denied,
+
+        SessionMode::FlexiblePassword { password_hash } => {
+            let attempt = password_attempt.unwrap_or("");
+            if crate::config::verify_password(attempt, password_hash) {
+                log::info!("session cancelled via password");
+                s.active_session = None;
+                CancelResult::Cancelled
+            } else {
+                CancelResult::WrongPassword
+            }
+        }
+
+        SessionMode::FlexibleDelay { delay_secs } => {
+            let delay = Duration::from_secs(*delay_secs);
+            if let Some(req_at) = session.cancel_requested_at {
+                if req_at.elapsed() >= delay {
+                    log::info!("session cancel delay expired — cancelling");
+                    s.active_session = None;
+                    return CancelResult::Cancelled;
+                }
+                let remaining = delay.checked_sub(req_at.elapsed()).unwrap_or_default();
+                CancelResult::PendingDelay { remaining_secs: remaining.as_secs() }
+            } else {
+                session.cancel_requested_at = Some(Instant::now());
+                CancelResult::PendingDelay { remaining_secs: delay.as_secs() }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelResult {
+    NoSession,
+    Cancelled,
+    Denied,
+    WrongPassword,
+    PendingDelay { remaining_secs: u64 },
+}
+
